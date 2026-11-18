@@ -71,26 +71,41 @@ function pktLines(items: readonly (string | Buffer | 'flush')[]): Buffer {
   return Buffer.concat(parts);
 }
 
+/** Hex digit value of a byte (masked to ASCII, as the old regex saw it), or -1. */
+function hexVal(byte: number): number {
+  const b = byte & 0x7f;
+  if (b >= 48 && b <= 57) return b - 48;
+  if (b >= 97 && b <= 102) return b - 87;
+  if (b >= 65 && b <= 70) return b - 55;
+  return -1;
+}
+
+/** One shared empty buffer for pkt-line flush/delim/end payloads. */
+const EMPTY_BUFFER = Buffer.alloc(0);
+
 /** Decode pkt-lines from the head of `buf`. Returns the packets and the offset just past them. */
 function decodePktLinesHead(buf: Buffer): { packets: { kind: 'data' | 'flush' | 'delim' | 'end'; payload: Buffer }[]; offset: number } {
   const packets: { kind: 'data' | 'flush' | 'delim' | 'end'; payload: Buffer }[] = [];
   let offset = 0;
   while (offset + 4 <= buf.length) {
-    const head = buf.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) break;
-    const len = Number.parseInt(head, 16);
+    const h0 = hexVal(buf[offset]);
+    const h1 = hexVal(buf[offset + 1]);
+    const h2 = hexVal(buf[offset + 2]);
+    const h3 = hexVal(buf[offset + 3]);
+    if (h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0) break;
+    const len = (h0 << 12) | (h1 << 8) | (h2 << 4) | h3;
     if (len === 0) {
-      packets.push({ kind: 'flush', payload: Buffer.alloc(0) });
+      packets.push({ kind: 'flush', payload: EMPTY_BUFFER });
       offset += 4;
       continue;
     }
     if (len === 1) {
-      packets.push({ kind: 'delim', payload: Buffer.alloc(0) });
+      packets.push({ kind: 'delim', payload: EMPTY_BUFFER });
       offset += 4;
       continue;
     }
     if (len === 2) {
-      packets.push({ kind: 'end', payload: Buffer.alloc(0) });
+      packets.push({ kind: 'end', payload: EMPTY_BUFFER });
       offset += 4;
       continue;
     }
@@ -352,17 +367,20 @@ function readPack(pack: Buffer, lookup?: (oid: string) => GitObject | undefined)
   const raw: Raw[] = [];
   const byOffset = new Map<number, Raw>();
   let offset = 12;
+  let hasDelta = false;
   for (let i = 0; i < count; i += 1) {
     const entryOffset = offset;
     const header = readPackVarint(pack, offset);
     offset = header.next;
     const code = (header.first >> 4) & 0x07;
-    const entry: Raw = { offset: entryOffset, code, size: header.size, data: Buffer.alloc(0) };
+    const entry: Raw = { offset: entryOffset, code, size: header.size, data: EMPTY_BUFFER };
     if (code === 6) {
+      hasDelta = true;
       const base = readOfsBase(pack, offset);
       offset = base.next;
       entry.baseOffset = entryOffset - base.baseOffset;
     } else if (code === 7) {
+      hasDelta = true;
       entry.baseOid = pack.subarray(offset, offset + 20).toString('hex');
       offset += 20;
     } else if (!CODE_TYPE[code]) {
@@ -378,6 +396,16 @@ function readPack(pack: Buffer, lookup?: (oid: string) => GitObject | undefined)
   if (offset !== trailerStart) throw new Error('pack has trailing bytes');
 
   const objects = new Map<string, GitObject>();
+  if (!hasDelta) {
+    // Whole objects only (every bench push, most fetches): no delta resolution,
+    // no offset/oid maps, just hash each entry straight into the store.
+    for (const entry of raw) {
+      const type = CODE_TYPE[entry.code];
+      const oid = hashObject(type, entry.data);
+      if (!objects.has(oid)) objects.set(oid, { type, data: entry.data });
+    }
+    return objects;
+  }
   const byOid = new Map<string, Raw>();
   const resolving = new Set<number>();
   const resolve = (entry: Raw): GitObject => {
@@ -504,6 +532,8 @@ interface IssueState {
   state: 'open' | 'closed';
   labels: string[];
   createdCounter: number;
+  /** Serialized issueJson, cleared on any mutation; the hot GET-single-issue path serves it. */
+  jsonCache: string | null;
 }
 
 interface PullState {
@@ -705,6 +735,27 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extraHeade
   res.end(text);
 }
 
+/** sendJson for a body already serialized (no second stringify). */
+function sendJsonText(res: ServerResponse, status: number, text: string, extraHeaders?: Record<string, string>): void {
+  requestCounter += 1;
+  const headers: Record<string, string> = {
+    'content-type': 'application/json; charset=utf-8',
+    'x-github-request-id': `forge-${requestCounter.toString(36).padStart(6, '0')}`,
+    'x-ratelimit-limit': '5000',
+    'x-ratelimit-remaining': '4999',
+    'x-ratelimit-reset': '1772000000',
+  };
+  if (extraHeaders) for (const [key, value] of Object.entries(extraHeaders)) headers[key] = value;
+  res.writeHead(status, headers);
+  res.end(text);
+}
+
+/** The issue's serialized REST body, cached until a mutation clears it. */
+function issueJsonText(repo: RepoState, issue: IssueState): string {
+  if (issue.jsonCache === null) issue.jsonCache = JSON.stringify(issueJson(repo, issue));
+  return issue.jsonCache;
+}
+
 function sendError(res: ServerResponse, status: number, message: string): void {
   sendJson(res, status, { message });
 }
@@ -729,12 +780,16 @@ async function readJsonBody(req: IncomingMessage): Promise<{ value: unknown; ok:
   }
 }
 
+/** The shop token and its Authorization header values, read once at startup. */
+const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+const SHOP_AUTH_BEARER = `Bearer ${SHOP_TOKEN}`;
+const SHOP_AUTH_TOKEN = `token ${SHOP_TOKEN}`;
+
 function expectToken(req: IncomingMessage): boolean {
-  const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  if (!SHOP_TOKEN) return true;
   const auth = req.headers.authorization;
-  if (!token) return true;
   if (!auth) return false;
-  return auth === `Bearer ${token}` || auth === `token ${token}`;
+  return auth === SHOP_AUTH_BEARER || auth === SHOP_AUTH_TOKEN;
 }
 
 function authenticateApi(req: IncomingMessage, res: ServerResponse): boolean {
@@ -744,8 +799,10 @@ function authenticateApi(req: IncomingMessage, res: ServerResponse): boolean {
 }
 
 function parseQuery(req: IncomingMessage): URLSearchParams {
+  const raw = req.url ?? '/';
+  if (raw.indexOf('?') < 0) return new URLSearchParams();
   const host = req.headers.host ?? 'localhost';
-  const url = new URL(req.url ?? '/', `http://${host}`);
+  const url = new URL(raw, `http://${host}`);
   return url.searchParams;
 }
 
@@ -803,6 +860,17 @@ function refLines(repo: RepoState): RefLine[] {
   return lines;
 }
 
+/** The upload-pack v2 capability advertisement never changes: build it once. */
+const V2_ADVERT_BODY: Buffer = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine('agent=forge/1.0\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow filter\n'),
+  pktLine('server-option\n'),
+  pktLine('object-format=sha1\n'),
+  pktFlush(),
+]);
+
 function sendAdvertisement(res: ServerResponse, repo: RepoState, service: 'upload-pack' | 'receive-pack', isV2: boolean): void {
   requestCounter += 1;
   const headers: Record<string, string> = {
@@ -829,17 +897,8 @@ function sendAdvertisement(res: ServerResponse, repo: RepoState, service: 'uploa
     return;
   }
   if (isV2) {
-    const caps = [
-      pktLine('version 2\n'),
-      pktLine('agent=forge/1.0\n'),
-      pktLine('ls-refs=unborn\n'),
-      pktLine('fetch=shallow filter\n'),
-      pktLine('server-option\n'),
-      pktLine('object-format=sha1\n'),
-      pktFlush(),
-    ];
     res.writeHead(200, headers);
-    res.end(Buffer.concat(caps));
+    res.end(V2_ADVERT_BODY);
     return;
   }
   const caps = 'symref=HEAD:refs/heads/main side-band-64k thin-pack ofs-delta shallow agent=forge/1.0';
@@ -886,6 +945,45 @@ function ancestorsOf(repo: RepoState, tip: string): string[] {
     for (const parent of commit.parents) queue.push(parent);
   }
   return order;
+}
+
+/** Only the parent lines of a commit object, without building the full commit view. */
+function commitParents(data: Uint8Array): string[] {
+  const buf = asBuffer(data);
+  const parents: string[] = [];
+  let offset = 0;
+  while (offset < buf.length) {
+    const nl = buf.indexOf(0x0a, offset);
+    const end = nl < 0 ? buf.length : nl;
+    if (end === offset) break; // blank line: end of the header
+    if (end - offset > 7 && buf[offset] === 0x70 && buf[offset + 1] === 0x61 && buf[offset + 2] === 0x72 && buf[offset + 3] === 0x65 && buf[offset + 4] === 0x6e && buf[offset + 5] === 0x74 && buf[offset + 6] === 0x20) {
+      parents.push(buf.subarray(offset + 7, end).toString('ascii').trim());
+    }
+    if (nl < 0) break;
+    offset = nl + 1;
+  }
+  return parents;
+}
+
+/**
+ * True when `ancestor` is reachable from `tip` by following parents, stopping at the
+ * first hit instead of walking the whole history. Same answer as
+ * `ancestorsOf(repo, tip).includes(ancestor)`: a linear push finds its old tip in one
+ * step, and only a non-fast-forward (or a merge-shaped) push walks further.
+ */
+function isReachable(repo: RepoState, ancestor: string, tip: string): boolean {
+  const seen = new Set<string>();
+  const stack: string[] = [tip];
+  while (stack.length > 0) {
+    const oid = stack.pop()!;
+    if (oid === ancestor) return true;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const object = repo.objects.get(oid);
+    if (!object || object.type !== 'commit') continue;
+    for (const parent of commitParents(object.data)) stack.push(parent);
+  }
+  return false;
 }
 
 function flattenTree(repo: RepoState, treeOid: string, prefix = ''): Map<string, { mode: string; oid: string }> {
@@ -1345,8 +1443,8 @@ async function handleReceivePack(req: IncomingMessage, res: ServerResponse, repo
       results.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
       continue;
     }
-    const ancestors = new Set(ancestorsOf(repo, command.newOid));
-    if (ancestors.has(command.oldOid)) {
+    const ancestors = isReachable(repo, command.oldOid, command.newOid);
+    if (ancestors) {
       repo.refs.set(command.ref, command.newOid);
       results.push({ ref: command.ref, ok: true });
     } else {
@@ -1882,9 +1980,10 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
             state: 'open',
             labels: labelNames,
             createdCounter: store.tick(),
+            jsonCache: null,
           };
           repo.issues.set(number, issue);
-          sendJson(res, 201, issueJson(repo, issue));
+          sendJsonText(res, 201, issueJsonText(repo, issue));
           return;
         }
         sendError(res, 404, 'Not Found');
@@ -1900,7 +1999,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
         const pull = repo.pulls.get(number);
         if (method === 'GET') {
           if (issue) {
-            sendJson(res, 200, issueJson(repo, issue));
+            sendJsonText(res, 200, issueJsonText(repo, issue));
             return;
           }
           if (pull) {
@@ -1931,7 +2030,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segments: s
           if (typeof body.title === 'string') issue.title = body.title;
           if (typeof body.body === 'string') issue.body = body.body;
           if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
-          sendJson(res, 200, issueJson(repo, issue));
+          issue.jsonCache = null;
+          sendJsonText(res, 200, issueJsonText(repo, issue));
           return;
         }
         sendError(res, 404, 'Not Found');
@@ -2837,6 +2937,7 @@ function executeMutation(
       state: 'open',
       labels: [],
       createdCounter: store.tick(),
+      jsonCache: null,
     };
     repo.issues.set(number, issue);
     return { issue: { repo, issue } };
@@ -2846,6 +2947,7 @@ function executeMutation(
     const found = ctx.issueById(String(input.issueId ?? ''));
     if (!found) throw new GqlFieldError('Issue not found');
     found.issue.state = 'closed';
+    found.issue.jsonCache = null;
     return { issue: { repo: found.repo, issue: found.issue } };
   }
   if (field.name === 'createPullRequest') {
@@ -3209,6 +3311,7 @@ function mcpCallTool(name: string, args: Record<string, unknown>): Json {
         state: 'open',
         labels: [],
         createdCounter: store.tick(),
+        jsonCache: null,
       };
       repo.issues.set(number, issue);
       return mcpToolOk(issueJson(repo, issue));
@@ -3360,7 +3463,7 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   try {
     const rawPath = (req.url ?? '/').split('?')[0];
-    const path = decodeURIComponent(rawPath);
+    const path = rawPath.includes('%') ? decodeURIComponent(rawPath) : rawPath;
     if (path === '/healthz') {
       if (req.method === 'GET') {
         sendJson(res, 200, { ok: true });
@@ -3369,7 +3472,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       sendError(res, 404, 'Not Found');
       return;
     }
-    const gitMatch = path.match(/^\/([^/]+)\/([^/]+)\.git\/(.*)$/);
+    const gitMatch = path.includes('.git/') ? path.match(/^\/([^/]+)\/([^/]+)\.git\/(.*)$/) : null;
     if (gitMatch) {
       const owner = gitMatch[1];
       const repoName = gitMatch[2];
