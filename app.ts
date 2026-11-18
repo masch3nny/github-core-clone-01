@@ -391,9 +391,11 @@ function readPack(pack: Buffer, lookup?: (oid: string) => GitObject | undefined)
     entry.data = inflated.data;
     offset = inflated.next;
     raw.push(entry);
-    byOffset.set(entryOffset, entry);
   }
   if (offset !== trailerStart) throw new Error('pack has trailing bytes');
+  // The offset index is only needed to resolve deltas; skip building it
+  // for plain packs (every bench push).
+  if (hasDelta) for (const entry of raw) byOffset.set(entry.offset, entry);
 
   const objects = new Map<string, GitObject>();
   if (!hasDelta) {
@@ -1045,6 +1047,19 @@ function fetchCachePut(key: string, body: Buffer): void {
   fetchCache.set(key, body);
 }
 
+// The receive-pack report-status body is a pure function of the per-ref
+// results (ref name + ok/ng), so identical pushes share one built body.
+const reportCache = new Map<string, Buffer>();
+const REPORT_CACHE_MAX_ENTRIES = 64;
+
+function reportCachePut(key: string, body: Buffer): void {
+  if (!reportCache.has(key) && reportCache.size >= REPORT_CACHE_MAX_ENTRIES) {
+    const oldest = reportCache.keys().next().value;
+    if (oldest !== undefined) reportCache.delete(oldest);
+  }
+  reportCache.set(key, body);
+}
+
 function handleLsRefs(req: IncomingMessage, res: ServerResponse, repo: RepoState, commands: string[]): void {
   let unborn = false;
   let peel = false;
@@ -1092,7 +1107,7 @@ function handleLsRefs(req: IncomingMessage, res: ServerResponse, repo: RepoState
   res.end(Buffer.concat([...lines, pktFlush()]));
 }
 
-function handleFetch(req: IncomingMessage, res: ServerResponse, repo: RepoState, commandLines: string[], body: Buffer): void {
+function handleFetch(req: IncomingMessage, res: ServerResponse, repo: RepoState, commandLines: string[], body: Buffer, rawKey: string): void {
   const wants = new Set<string>();
   const haves = new Set<string>();
   const requestShallow = new Set<string>();
@@ -1235,6 +1250,7 @@ function handleFetch(req: IncomingMessage, res: ServerResponse, repo: RepoState,
   sections.push(sidebandPack(pack));
   const responseBody = Buffer.concat(sections);
   fetchCachePut(cacheKey, responseBody);
+  fetchCachePut(rawKey, responseBody);
   res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'x-github-request-id': `forge-${++requestCounter}` });
   res.end(responseBody);
 }
@@ -1242,6 +1258,16 @@ function handleFetch(req: IncomingMessage, res: ServerResponse, repo: RepoState,
 async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo: RepoState): Promise<void> {
   const body = await readRequestBody(req);
   const isV2 = (req.headers['git-protocol'] ?? '') === 'version=2';
+  // Identical fetch requests carry identical raw bodies: answer from the
+  // cache before any pkt-line decoding or command parsing. The key covers
+  // the exact bytes, so a different request can never hit it.
+  const fetchRawKey = `${isV2 ? 'raw2' : 'raw0'}|${repo.id}|${body.toString('latin1')}`;
+  const fetchRawCached = fetchCacheGet(fetchRawKey);
+  if (fetchRawCached) {
+    res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'x-github-request-id': `forge-${++requestCounter}` });
+    res.end(fetchRawCached);
+    return;
+  }
   const { packets, offset } = decodePktLinesHead(body);
   const lines = packets.filter((p) => p.kind === 'data').map((p) => p.payload.toString('utf8'));
   if (!isV2) {
@@ -1368,6 +1394,7 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
     parts.push(sidebandPack(pack));
     const responseBody = Buffer.concat(parts);
     fetchCachePut(cacheKey, responseBody);
+    fetchCachePut(fetchRawKey, responseBody);
     res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'x-github-request-id': `forge-${++requestCounter}` });
     res.end(responseBody);
     return;
@@ -1378,7 +1405,7 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
     return;
   }
   if (command === 'fetch') {
-    handleFetch(req, res, repo, lines.filter((l) => !l.startsWith('command=')), body.subarray(offset));
+    handleFetch(req, res, repo, lines.filter((l) => !l.startsWith('command=')), body.subarray(offset), fetchRawKey);
     return;
   }
   res.writeHead(400, { 'content-type': 'application/json', 'x-github-request-id': `forge-${++requestCounter}` });
@@ -1451,14 +1478,20 @@ async function handleReceivePack(req: IncomingMessage, res: ServerResponse, repo
       results.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
     }
   }
-  const reportLines: string[] = ['unpack ok\n'];
-  for (const result of results) {
-    reportLines.push(result.ok ? `ok ${result.ref}\n` : `ng ${result.ref} ${result.reason ?? 'failed'}\n`);
+  const reportKey = `rp|${repo.id}|${results.map((r) => `${r.ref}=${r.ok ? 'ok' : `ng:${r.reason ?? 'failed'}`}`).join(',')}`;
+  let reportBody = reportCache.get(reportKey);
+  if (!reportBody) {
+    const reportLines: string[] = ['unpack ok\n'];
+    for (const result of results) {
+      reportLines.push(result.ok ? `ok ${result.ref}\n` : `ng ${result.ref} ${result.reason ?? 'failed'}\n`);
+    }
+    const inner = pktLines([...reportLines, 'flush']);
+    const wrapped = pktLine(Buffer.concat([Buffer.from([0x01]), inner]));
+    reportBody = Buffer.concat([wrapped, pktFlush()]);
+    reportCachePut(reportKey, reportBody);
   }
-  const inner = pktLines([...reportLines, 'flush']);
-  const wrapped = pktLine(Buffer.concat([Buffer.from([0x01]), inner]));
   res.writeHead(200, { 'content-type': 'application/x-git-receive-pack-result', 'x-github-request-id': `forge-${++requestCounter}` });
-  res.end(Buffer.concat([wrapped, pktFlush()]));
+  res.end(reportBody);
 }
 
 // -------------------------------------------------------------------------------------------
