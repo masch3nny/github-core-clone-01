@@ -766,7 +766,7 @@ function readRequestBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (chunk: Buffer) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 0 ? EMPTY_BUFFER : chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -1060,7 +1060,14 @@ function reportCachePut(key: string, body: Buffer): void {
   reportCache.set(key, body);
 }
 
-function handleLsRefs(req: IncomingMessage, res: ServerResponse, repo: RepoState, commands: string[]): void {
+/** A short key for the ref state an ls-refs answer depends on (default branch + every ref tip). */
+function refStateKey(repo: RepoState): string {
+  let key = `refs/heads/${repo.defaultBranch}|`;
+  for (const [name, oid] of repo.refs) key += `${name}=${oid},`;
+  return key;
+}
+
+function handleLsRefs(req: IncomingMessage, res: ServerResponse, repo: RepoState, commands: string[], cacheKey: string): void {
   let unborn = false;
   let peel = false;
   let symrefs = false;
@@ -1090,8 +1097,10 @@ function handleLsRefs(req: IncomingMessage, res: ServerResponse, repo: RepoState
   };
   if (unborn && !repo.refs.has(headRef)) {
     if (refPrefixes.length === 0) lines.push(pktLine(`${ZERO_OID} HEAD symref-target:${headRef}\n`));
+    const unbornBody = Buffer.concat([...lines, pktFlush()]);
+    fetchCachePut(cacheKey, unbornBody);
     res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'x-github-request-id': `forge-${++requestCounter}` });
-    res.end(Buffer.concat([...lines, pktFlush()]));
+    res.end(unbornBody);
     return;
   }
   for (const ref of refs) {
@@ -1103,8 +1112,10 @@ function handleLsRefs(req: IncomingMessage, res: ServerResponse, repo: RepoState
     if (peel && ref.peeled) line += ` peeled:${ref.peeled}`;
     lines.push(pktLine(`${line}\n`));
   }
+  const responseBody = Buffer.concat([...lines, pktFlush()]);
+  fetchCachePut(cacheKey, responseBody);
   res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'x-github-request-id': `forge-${++requestCounter}` });
-  res.end(Buffer.concat([...lines, pktFlush()]));
+  res.end(responseBody);
 }
 
 function handleFetch(req: IncomingMessage, res: ServerResponse, repo: RepoState, commandLines: string[], body: Buffer, rawKey: string): void {
@@ -1261,11 +1272,23 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
   // Identical fetch requests carry identical raw bodies: answer from the
   // cache before any pkt-line decoding or command parsing. The key covers
   // the exact bytes, so a different request can never hit it.
-  const fetchRawKey = `${isV2 ? 'raw2' : 'raw0'}|${repo.id}|${body.toString('latin1')}`;
+  const bodyLatin1 = body.toString('latin1');
+  const fetchRawKey = `${isV2 ? 'raw2' : 'raw0'}|${repo.id}|${bodyLatin1}`;
   const fetchRawCached = fetchCacheGet(fetchRawKey);
   if (fetchRawCached) {
     res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'x-github-request-id': `forge-${++requestCounter}` });
     res.end(fetchRawCached);
+    return;
+  }
+  // ls-refs answers are likewise a pure function of the request bytes plus
+  // the ref state: answer identical ones from the cache before decoding.
+  // (The key carries the full ref state, so a push that moves any ref can
+  // never read a stale answer.)
+  const lsRawKey = `ls|${repo.id}|${refStateKey(repo)}|${bodyLatin1}`;
+  const lsRawCached = fetchCacheGet(lsRawKey);
+  if (lsRawCached) {
+    res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'x-github-request-id': `forge-${++requestCounter}` });
+    res.end(lsRawCached);
     return;
   }
   const { packets, offset } = decodePktLinesHead(body);
@@ -1401,7 +1424,7 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
   }
   const command = lines.find((l) => l.startsWith('command='))?.slice('command='.length).trim();
   if (command === 'ls-refs') {
-    handleLsRefs(req, res, repo, lines.filter((l) => !l.startsWith('command=')));
+    handleLsRefs(req, res, repo, lines.filter((l) => !l.startsWith('command=')), lsRawKey);
     return;
   }
   if (command === 'fetch') {
@@ -3516,8 +3539,11 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         return;
       }
       if (rest === 'info/refs' && req.method === 'GET') {
-        const query = parseQuery(req);
-        const service = query.get('service') ?? '';
+        // The only query param here is `service=`; pull it out without
+        // paying for a URL + URLSearchParams parse on every advert.
+        const rawUrl = req.url ?? '';
+        const serviceIdx = rawUrl.indexOf('service=');
+        const service = serviceIdx < 0 ? '' : rawUrl.slice(serviceIdx + 8).split('&')[0];
         if (service === 'git-upload-pack') {
           const isV2 = (req.headers['git-protocol'] ?? '') === 'version=2';
           sendAdvertisement(res, repo, 'upload-pack', isV2);
